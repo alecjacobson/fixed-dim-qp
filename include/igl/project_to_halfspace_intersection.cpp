@@ -1,6 +1,7 @@
 #include "project_to_halfspace_intersection.h"
 #include <Eigen/Dense>
 #include <vector>
+#include <array>
 #include <numeric>
 #include <algorithm>
 #include <random>
@@ -28,9 +29,20 @@ namespace igl
     }
 
     // Recursive Seidel/SDLP-style projection of q onto the intersection of
-    // the halfspaces named by `ids`, restricted to the affine subspace
-    // {o + U*z : z in R^d}. See project_to_halfspace_intersection.h and
+    // the first `count` halfspaces named by `ids` (a fixed permutation
+    // shared by every recursion level -- only the prefix *length* shrinks on
+    // dimension reduction, so it's passed as a range rather than copied),
+    // restricted to the affine subspace {o + U*z : z in R^d}. See
+    // project_to_halfspace_intersection.h and
     // progressive_hulls_fixed_dim_qp_design.md, "Core algorithm".
+    //
+    // active_out/active_count use a fixed Dim-sized scratch array rather
+    // than a heap-allocated container: the active support never exceeds Dim
+    // by construction (d strictly decreases by one per activation and
+    // starts at Dim), so this and the ids-by-range change above keep the
+    // whole recursion allocation-free except for the small per-level
+    // Eigen::Dynamic temporaries (alpha/N/U_new), whose size is bounded by
+    // the current dimension d <= Dim.
     template <typename Scalar, int Dim>
     IGL_INLINE bool halfspace_projection_recurse(
       const Eigen::Matrix<Scalar,Dim,1> & q,
@@ -38,29 +50,32 @@ namespace igl
       const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b,
       const HalfspaceProjectionOptions<Scalar> & options,
       const std::vector<int> & ids,
+      const int count,
       const Eigen::Matrix<Scalar,Dim,1> & o,
       const Eigen::Matrix<Scalar,Dim,Eigen::Dynamic> & U,
       int d,
       uint32_t & diagnostics,
       Eigen::Matrix<Scalar,Dim,1> & p_out,
-      std::vector<int> & active_out)
+      std::array<int,Dim> & active_out,
+      int & active_count)
     {
       if(d == 0)
       {
-        for(const int id : ids)
+        for(int idx = 0;idx < count;idx++)
         {
+          const int id = ids[idx];
           const Scalar lhs = A.row(id) * o;
           if(lhs < b(id) - options.eps_feasible) return false;
         }
         p_out = o;
-        active_out.clear();
+        active_count = 0;
         return true;
       }
 
       p_out = o + U * (U.transpose() * (q - o));
-      active_out.clear();
+      active_count = 0;
 
-      for(size_t idx = 0;idx < ids.size();idx++)
+      for(int idx = 0;idx < count;idx++)
       {
         const int i = ids[idx];
         const Scalar lhs = A.row(i) * p_out;
@@ -93,17 +108,18 @@ namespace igl
         const Eigen::Matrix<Scalar,Eigen::Dynamic,Eigen::Dynamic> N = orthonormal_complement<Scalar>(alpha_unit);
         const Eigen::Matrix<Scalar,Dim,Eigen::Dynamic> U_new = U * N;
 
-        const std::vector<int> prefix(ids.begin(), ids.begin() + idx);
         Eigen::Matrix<Scalar,Dim,1> p2;
-        std::vector<int> active2;
+        std::array<int,Dim> active2;
+        int active2_count = 0;
         if(!halfspace_projection_recurse<Scalar,Dim>(
-             q, A, b, options, prefix, o_new, U_new, d - 1, diagnostics, p2, active2))
+             q, A, b, options, ids, idx, o_new, U_new, d - 1, diagnostics, p2, active2, active2_count))
         {
           return false;
         }
         p_out = p2;
         active_out = active2;
-        active_out.push_back(i);
+        active_count = active2_count;
+        active_out[active_count++] = i;
       }
       return true;
     }
@@ -145,9 +161,10 @@ IGL_INLINE igl::HalfspaceProjectionStatus igl::project_to_halfspace_intersection
 
   uint32_t diagnostics = 0;
   Eigen::Matrix<Scalar,Dim,1> p;
-  std::vector<int> active;
+  std::array<int,Dim> active;
+  int active_count_raw = 0;
   const bool feasible = igl::internal::halfspace_projection_recurse<Scalar,Dim>(
-    q, A, b_eff, options, ids, o, U, Dim, diagnostics, p, active);
+    q, A, b_eff, options, ids, static_cast<int>(m), o, U, Dim, diagnostics, p, active, active_count_raw);
 
   if(options.eps_outward > 0) diagnostics |= IGL_HSP_DIAG_CONSERVATIVE_OFFSET_APPLIED;
   result.diagnostics = diagnostics;
@@ -164,7 +181,7 @@ IGL_INLINE igl::HalfspaceProjectionStatus igl::project_to_halfspace_intersection
   }
 
   result.p = p;
-  result.active_count = static_cast<int>(std::min<size_t>(active.size(), static_cast<size_t>(Dim)));
+  result.active_count = std::min(active_count_raw, Dim);
   for(int r = 0;r < result.active_count;r++) result.active_ids[r] = active[static_cast<size_t>(r)];
 
   Scalar max_violation = Scalar(0);
