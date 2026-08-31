@@ -20,8 +20,33 @@ the reduction from the regularized objective to a plain projection via
 
 ## Status
 
-Under active development. See the design spec for the full contract, test
-plan, and acceptance criteria.
+The solver, exhaustive oracle, and sections A-C of the design spec's test
+plan (deterministic, randomized differential, and metamorphic tests) are
+implemented and passing in CI. Section D/E (mesh-level regression, stress/
+fuzz, performance) live in the separate bench repo below, along with the
+accuracy/perf comparison against `igl::copyleft::quadprog` and
+`igl::linprog`.
+
+## Usage
+
+```cpp
+#include <igl/project_to_halfspace_intersection.h>
+
+Eigen::Vector3d q(5,5,5); // preferred point
+Eigen::Matrix<double,Eigen::Dynamic,3> A(3,3); // row i: halfspace normal a_i
+A << 1,0,0,  0,1,0,  0,0,1;
+Eigen::VectorXd b(3); b << 0,0,0; // row i: halfspace offset b_i (a_i^T p >= b_i)
+
+igl::HalfspaceProjectionOptions<double> options;
+igl::HalfspaceProjectionResult<double,3> result;
+const auto status = igl::project_to_halfspace_intersection<double,3>(q, A, b, options, result);
+// status == igl::HalfspaceProjectionStatus::SUCCESS
+// result.p == (1,1,1), result.active_count == 3
+```
+
+To solve the regularized progressive-hulls placement QP
+`min_p g^T p + (lambda/2)||p-p0||^2 s.t. Ap>=b`, reduce it to a projection
+first: `q = p0 - g/(2*lambda)`.
 
 ## Layout
 
