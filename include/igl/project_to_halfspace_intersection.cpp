@@ -11,55 +11,131 @@ namespace igl
 {
   namespace internal
   {
-    // Orthonormal basis (d x (d-1)) of the orthogonal complement of a unit
-    // vector in R^d, for any d >= 1 (d==1 yields a d x 0 empty basis). Built
-    // on Eigen's Householder QR rather than hand-specialized 3D/2D formulas:
-    // at these sizes (d <= Dim <= a handful) the cost is negligible and the
-    // reflector construction is already robust to the normal being close to
-    // any particular coordinate axis, which is exactly the "robust fallback
-    // axis selection" the design spec asks for.
-    template <typename Scalar>
-    IGL_INLINE Eigen::Matrix<Scalar,Eigen::Dynamic,Eigen::Dynamic> orthonormal_complement(
-      const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & unit_vec)
+    // Orthonormal basis of the orthogonal complement of a unit vector in
+    // R^D, D a compile-time constant (D==1 yields a D x 0 empty basis).
+    // Built on Eigen's Householder QR rather than hand-specialized 3D/2D
+    // cross-product formulas: with D fixed at compile time, Eigen already
+    // gives HouseholderQR fully stack-allocated, fixed-size storage here
+    // (no Eigen::Dynamic, no heap), and the reflector construction is
+    // already robust to the normal being close to any particular coordinate
+    // axis -- the "robust fallback axis selection" the design spec asks for.
+    template <typename Scalar, int D>
+    IGL_INLINE Eigen::Matrix<Scalar,D,D-1> orthonormal_complement(
+      const Eigen::Matrix<Scalar,D,1> & unit_vec)
     {
-      const Eigen::Index d = unit_vec.size();
-      Eigen::HouseholderQR<Eigen::Matrix<Scalar,Eigen::Dynamic,1>> qr(unit_vec);
-      const Eigen::Matrix<Scalar,Eigen::Dynamic,Eigen::Dynamic> Q = qr.householderQ();
-      return Q.rightCols(d - 1);
+      Eigen::HouseholderQR<Eigen::Matrix<Scalar,D,1>> qr(unit_vec);
+      const Eigen::Matrix<Scalar,D,D> Q = qr.householderQ();
+      return Q.template rightCols<D-1>();
     }
 
     // Recursive Seidel/SDLP-style projection of q onto the intersection of
     // the first `count` halfspaces named by `ids` (a fixed permutation
     // shared by every recursion level -- only the prefix *length* shrinks on
     // dimension reduction, so it's passed as a range rather than copied),
-    // restricted to the affine subspace {o + U*z : z in R^d}. See
+    // restricted to the affine subspace {o + U*z : z in R^D}. See
     // project_to_halfspace_intersection.h and
     // progressive_hulls_fixed_dim_qp_design.md, "Core algorithm".
     //
-    // active_out/active_count use a fixed Dim-sized scratch array rather
-    // than a heap-allocated container: the active support never exceeds Dim
-    // by construction (d strictly decreases by one per activation and
-    // starts at Dim), so this and the ids-by-range change above keep the
-    // whole recursion allocation-free except for the small per-level
-    // Eigen::Dynamic temporaries (alpha/N/U_new), whose size is bounded by
-    // the current dimension d <= Dim.
-    template <typename Scalar, int Dim>
-    IGL_INLINE bool halfspace_projection_recurse(
-      const Eigen::Matrix<Scalar,Dim,1> & q,
-      const Eigen::Matrix<Scalar,Eigen::Dynamic,Dim> & A,
-      const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b,
-      const HalfspaceProjectionOptions<Scalar> & options,
-      const std::vector<int> & ids,
-      const int count,
-      const Eigen::Matrix<Scalar,Dim,1> & o,
-      const Eigen::Matrix<Scalar,Dim,Eigen::Dynamic> & U,
-      int d,
-      uint32_t & diagnostics,
-      Eigen::Matrix<Scalar,Dim,1> & p_out,
-      std::array<int,Dim> & active_out,
-      int & active_count)
+    // D (the current free dimension, Dim down to 0) is a *template*
+    // parameter, not a runtime int: since Dim is small and known at compile
+    // time, every U/alpha/N in the whole recursion is a fixed-size Eigen
+    // type (stack-allocated, no Eigen::Dynamic), which is what actually
+    // makes this fast at these problem sizes -- letting `d` be a runtime
+    // value forced every intermediate matrix through Eigen's Dynamic path
+    // (heap-backed storage, no compile-time unrolling) even though the
+    // *size* was always known by construction to be <= Dim. The active set
+    // (bounded by Dim by construction) lives in a fixed std::array, not a
+    // std::vector, for the same reason.
+    template <typename Scalar, int Dim, int D>
+    struct HalfspaceRecursion
     {
-      if(d == 0)
+      static IGL_INLINE bool solve(
+        const Eigen::Matrix<Scalar,Dim,1> & q,
+        const Eigen::Matrix<Scalar,Eigen::Dynamic,Dim> & A,
+        const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b,
+        const HalfspaceProjectionOptions<Scalar> & options,
+        const std::vector<int> & ids,
+        const int count,
+        const Eigen::Matrix<Scalar,Dim,1> & o,
+        const Eigen::Matrix<Scalar,Dim,D> & U,
+        uint32_t & diagnostics,
+        Eigen::Matrix<Scalar,Dim,1> & p_out,
+        std::array<int,Dim> & active_out,
+        int & active_count)
+      {
+        p_out = o + U * (U.transpose() * (q - o));
+        active_count = 0;
+
+        for(int idx = 0;idx < count;idx++)
+        {
+          const int i = ids[idx];
+          const Scalar lhs = A.row(i) * p_out;
+          if(lhs >= b(i) - options.eps_feasible) continue; // not active
+
+          const Eigen::Matrix<Scalar,D,1> alpha = U.transpose() * A.row(i).transpose();
+          const Scalar beta = b(i) - static_cast<Scalar>(A.row(i) * o);
+          const Scalar alpha_sq = alpha.squaredNorm();
+          const Scalar alpha_norm = std::sqrt(alpha_sq);
+
+          if(alpha_norm <= options.eps_rank)
+          {
+            // a_i is (numerically) orthogonal to every remaining free
+            // direction, so a_i^T p is constant (== a_i^T o) throughout this
+            // subspace: either already-satisfied-elsewhere-but-flagged-here
+            // (redundant, tolerate) or genuinely unsatisfiable here (infeasible).
+            const Scalar lhs_o = A.row(i) * o;
+            if(lhs_o >= b(i) - options.eps_feasible)
+            {
+              diagnostics |= IGL_HSP_DIAG_REDUNDANT_PLANE_SEEN;
+              continue;
+            }
+            diagnostics |= IGL_HSP_DIAG_RANK_DROP;
+            return false;
+          }
+
+          const Eigen::Matrix<Scalar,D,1> z0 = (beta / alpha_sq) * alpha;
+          const Eigen::Matrix<Scalar,Dim,1> o_new = o + U * z0;
+          const Eigen::Matrix<Scalar,D,1> alpha_unit = alpha / alpha_norm;
+          const Eigen::Matrix<Scalar,D,D-1> N = orthonormal_complement<Scalar,D>(alpha_unit);
+          const Eigen::Matrix<Scalar,Dim,D-1> U_new = U * N;
+
+          Eigen::Matrix<Scalar,Dim,1> p2;
+          std::array<int,Dim> active2;
+          int active2_count = 0;
+          if(!HalfspaceRecursion<Scalar,Dim,D-1>::solve(
+               q, A, b, options, ids, idx, o_new, U_new, diagnostics, p2, active2, active2_count))
+          {
+            return false;
+          }
+          p_out = p2;
+          active_out = active2;
+          active_count = active2_count;
+          active_out[active_count++] = i;
+        }
+        return true;
+      }
+    };
+
+    // Base case: no free directions left. o is the unique point on the
+    // active-so-far affine subspace; verify every processed plane holds
+    // there. U is a Dim x 0 matrix (unused) -- kept only so every level of
+    // the recursion shares one call signature.
+    template <typename Scalar, int Dim>
+    struct HalfspaceRecursion<Scalar, Dim, 0>
+    {
+      static IGL_INLINE bool solve(
+        const Eigen::Matrix<Scalar,Dim,1> & /*q*/,
+        const Eigen::Matrix<Scalar,Eigen::Dynamic,Dim> & A,
+        const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b,
+        const HalfspaceProjectionOptions<Scalar> & options,
+        const std::vector<int> & ids,
+        const int count,
+        const Eigen::Matrix<Scalar,Dim,1> & o,
+        const Eigen::Matrix<Scalar,Dim,0> & /*U, unused*/,
+        uint32_t & /*diagnostics*/,
+        Eigen::Matrix<Scalar,Dim,1> & p_out,
+        std::array<int,Dim> & /*active_out*/,
+        int & active_count)
       {
         for(int idx = 0;idx < count;idx++)
         {
@@ -71,58 +147,7 @@ namespace igl
         active_count = 0;
         return true;
       }
-
-      p_out = o + U * (U.transpose() * (q - o));
-      active_count = 0;
-
-      for(int idx = 0;idx < count;idx++)
-      {
-        const int i = ids[idx];
-        const Scalar lhs = A.row(i) * p_out;
-        if(lhs >= b(i) - options.eps_feasible) continue; // not active
-
-        const Eigen::Matrix<Scalar,Eigen::Dynamic,1> alpha = U.transpose() * A.row(i).transpose();
-        const Scalar beta = b(i) - static_cast<Scalar>(A.row(i) * o);
-        const Scalar alpha_sq = alpha.squaredNorm();
-        const Scalar alpha_norm = std::sqrt(alpha_sq);
-
-        if(alpha_norm <= options.eps_rank)
-        {
-          // a_i is (numerically) orthogonal to every remaining free
-          // direction, so a_i^T p is constant (== a_i^T o) throughout this
-          // subspace: either already-satisfied-elsewhere-but-flagged-here
-          // (redundant, tolerate) or genuinely unsatisfiable here (infeasible).
-          const Scalar lhs_o = A.row(i) * o;
-          if(lhs_o >= b(i) - options.eps_feasible)
-          {
-            diagnostics |= IGL_HSP_DIAG_REDUNDANT_PLANE_SEEN;
-            continue;
-          }
-          diagnostics |= IGL_HSP_DIAG_RANK_DROP;
-          return false;
-        }
-
-        const Eigen::Matrix<Scalar,Eigen::Dynamic,1> z0 = (beta / alpha_sq) * alpha;
-        const Eigen::Matrix<Scalar,Dim,1> o_new = o + U * z0;
-        const Eigen::Matrix<Scalar,Eigen::Dynamic,1> alpha_unit = alpha / alpha_norm;
-        const Eigen::Matrix<Scalar,Eigen::Dynamic,Eigen::Dynamic> N = orthonormal_complement<Scalar>(alpha_unit);
-        const Eigen::Matrix<Scalar,Dim,Eigen::Dynamic> U_new = U * N;
-
-        Eigen::Matrix<Scalar,Dim,1> p2;
-        std::array<int,Dim> active2;
-        int active2_count = 0;
-        if(!halfspace_projection_recurse<Scalar,Dim>(
-             q, A, b, options, ids, idx, o_new, U_new, d - 1, diagnostics, p2, active2, active2_count))
-        {
-          return false;
-        }
-        p_out = p2;
-        active_out = active2;
-        active_count = active2_count;
-        active_out[active_count++] = i;
-      }
-      return true;
-    }
+    };
   }
 }
 
@@ -155,16 +180,15 @@ IGL_INLINE igl::HalfspaceProjectionStatus igl::project_to_halfspace_intersection
   std::mt19937_64 rng(options.seed);
   std::shuffle(ids.begin(), ids.end(), rng);
 
-  Eigen::Matrix<Scalar,Dim,1> o = Eigen::Matrix<Scalar,Dim,1>::Zero();
-  Eigen::Matrix<Scalar,Dim,Eigen::Dynamic> U(Dim,Dim);
-  U.setIdentity();
+  const Eigen::Matrix<Scalar,Dim,1> o = Eigen::Matrix<Scalar,Dim,1>::Zero();
+  const Eigen::Matrix<Scalar,Dim,Dim> U = Eigen::Matrix<Scalar,Dim,Dim>::Identity();
 
   uint32_t diagnostics = 0;
   Eigen::Matrix<Scalar,Dim,1> p;
   std::array<int,Dim> active;
   int active_count_raw = 0;
-  const bool feasible = igl::internal::halfspace_projection_recurse<Scalar,Dim>(
-    q, A, b_eff, options, ids, static_cast<int>(m), o, U, Dim, diagnostics, p, active, active_count_raw);
+  const bool feasible = igl::internal::HalfspaceRecursion<Scalar,Dim,Dim>::solve(
+    q, A, b_eff, options, ids, static_cast<int>(m), o, U, diagnostics, p, active, active_count_raw);
 
   if(options.eps_outward > 0) diagnostics |= IGL_HSP_DIAG_CONSERVATIVE_OFFSET_APPLIED;
   result.diagnostics = diagnostics;
