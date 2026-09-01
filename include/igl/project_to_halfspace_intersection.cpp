@@ -11,6 +11,37 @@ namespace igl
 {
   namespace internal
   {
+    // Lightweight, deterministic PRNG for the plane-processing permutation.
+    // std::mt19937_64 carries ~2.5kB of state and its seeding step alone
+    // costs more than the entire rest of a small solve here; splitmix64 (Vigna)
+    // is a few instructions per call and statistically adequate for a
+    // Fisher-Yates shuffle of a handful of elements -- the shuffle only needs
+    // to break adversarial plane orderings, not pass PRNG test suites.
+    struct SplitMix64
+    {
+      uint64_t state;
+      explicit SplitMix64(uint64_t seed) : state(seed) {}
+      IGL_INLINE uint64_t operator()()
+      {
+        uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+      }
+    };
+
+    // Fisher-Yates shuffle of ids[0:n) using SplitMix64. Avoids
+    // std::uniform_int_distribution's rejection-sampling overhead; a
+    // Lemire-style bounded reduction is more than sufficient for this use.
+    IGL_INLINE void small_shuffle(int * ids, int n, uint64_t seed)
+    {
+      SplitMix64 rng(seed);
+      for(int i = n - 1;i > 0;i--)
+      {
+        const int j = static_cast<int>(rng() % static_cast<uint64_t>(i + 1));
+        std::swap(ids[i], ids[j]);
+      }
+    }
     // Orthonormal basis of the orthogonal complement of a unit vector in
     // R^D, D a compile-time constant. A struct template (not a function
     // template) so it can be partially specialized per-D while keeping
@@ -101,7 +132,7 @@ namespace igl
         const Eigen::Matrix<Scalar,Eigen::Dynamic,Dim> & A,
         const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b,
         const HalfspaceProjectionOptions<Scalar> & options,
-        const std::vector<int> & ids,
+        const int * ids,
         const int count,
         const Eigen::Matrix<Scalar,Dim,1> & o,
         const Eigen::Matrix<Scalar,Dim,D> & U,
@@ -175,7 +206,7 @@ namespace igl
         const Eigen::Matrix<Scalar,Eigen::Dynamic,Dim> & A,
         const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b,
         const HalfspaceProjectionOptions<Scalar> & options,
-        const std::vector<int> & ids,
+        const int * ids,
         const int count,
         const Eigen::Matrix<Scalar,Dim,1> & o,
         const Eigen::Matrix<Scalar,Dim,0> & /*U, unused*/,
@@ -220,12 +251,30 @@ IGL_INLINE igl::HalfspaceProjectionStatus igl::project_to_halfspace_intersection
     return result.status;
   }
 
-  const Eigen::Matrix<Scalar,Eigen::Dynamic,1> b_eff = b.array() + options.eps_outward;
+  // Skip the b+eps_outward allocation entirely in the (common) eps_outward==0
+  // case rather than always materializing a fresh Dynamic vector.
+  Eigen::Matrix<Scalar,Eigen::Dynamic,1> b_eff_storage;
+  const Eigen::Matrix<Scalar,Eigen::Dynamic,1> * b_eff_ptr = &b;
+  if(options.eps_outward != Scalar(0))
+  {
+    b_eff_storage = b.array() + options.eps_outward;
+    b_eff_ptr = &b_eff_storage;
+  }
+  const Eigen::Matrix<Scalar,Eigen::Dynamic,1> & b_eff = *b_eff_ptr;
 
-  std::vector<int> ids(static_cast<size_t>(m));
-  std::iota(ids.begin(), ids.end(), 0);
-  std::mt19937_64 rng(options.seed);
-  std::shuffle(ids.begin(), ids.end(), rng);
+  // Typical mesh-collapse vertex-ring valence fits comfortably in a stack
+  // buffer; only fall back to the heap above that (still-correct) cap.
+  constexpr int kStackCapacity = 64;
+  int ids_stack[kStackCapacity];
+  std::vector<int> ids_heap;
+  int * ids_ptr = ids_stack;
+  if(m > kStackCapacity)
+  {
+    ids_heap.resize(static_cast<size_t>(m));
+    ids_ptr = ids_heap.data();
+  }
+  for(int i = 0;i < m;i++) ids_ptr[i] = i;
+  igl::internal::small_shuffle(ids_ptr, static_cast<int>(m), options.seed);
 
   const Eigen::Matrix<Scalar,Dim,1> o = Eigen::Matrix<Scalar,Dim,1>::Zero();
   const Eigen::Matrix<Scalar,Dim,Dim> U = Eigen::Matrix<Scalar,Dim,Dim>::Identity();
@@ -235,7 +284,7 @@ IGL_INLINE igl::HalfspaceProjectionStatus igl::project_to_halfspace_intersection
   std::array<int,Dim> active;
   int active_count_raw = 0;
   const bool feasible = igl::internal::HalfspaceRecursion<Scalar,Dim,Dim>::solve(
-    q, A, b_eff, options, ids, static_cast<int>(m), o, U, diagnostics, p, active, active_count_raw);
+    q, A, b_eff, options, ids_ptr, static_cast<int>(m), o, U, diagnostics, p, active, active_count_raw);
 
   if(options.eps_outward > 0) diagnostics |= IGL_HSP_DIAG_CONSERVATIVE_OFFSET_APPLIED;
   result.diagnostics = diagnostics;
