@@ -183,7 +183,9 @@ TEST_CASE("project_to_halfspace_intersection: cone-like rank-2 active", "[solver
   HalfspaceProjectionResult<double,3> r;
   auto status = project_to_halfspace_intersection<double,3>(q, A, b, default_options(), r);
   REQUIRE(status == HalfspaceProjectionStatus::SUCCESS);
-  REQUIRE(r.p.isApprox(Eigen::Vector3d(0,0,0)));
+  // p is exactly the zero vector, so isApprox's relative tolerance
+  // degenerates (min-norm reference is 0); compare via absolute norm instead.
+  REQUIRE(r.p.norm() < 1e-9);
   REQUIRE(r.active_count == 2);
 }
 

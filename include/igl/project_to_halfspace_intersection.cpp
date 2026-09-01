@@ -12,21 +12,68 @@ namespace igl
   namespace internal
   {
     // Orthonormal basis of the orthogonal complement of a unit vector in
-    // R^D, D a compile-time constant (D==1 yields a D x 0 empty basis).
-    // Built on Eigen's Householder QR rather than hand-specialized 3D/2D
-    // cross-product formulas: with D fixed at compile time, Eigen already
-    // gives HouseholderQR fully stack-allocated, fixed-size storage here
-    // (no Eigen::Dynamic, no heap), and the reflector construction is
-    // already robust to the normal being close to any particular coordinate
-    // axis -- the "robust fallback axis selection" the design spec asks for.
+    // R^D, D a compile-time constant. A struct template (not a function
+    // template) so it can be partially specialized per-D while keeping
+    // Scalar generic. D==1,2,3 use the design spec's originally-suggested
+    // explicit closed-form routines (null_basis_2_to_1, a hand cross-product
+    // construction for 3-to-2) rather than a general QR: at these sizes the
+    // arithmetic is a handful of flops with zero matrix-factorization
+    // overhead, which measurably matters when this runs per-collapse-candidate
+    // in a mesh simplifier. D>3 falls back to Householder QR (not expected
+    // on the primary Dim=3 path, kept only so the template stays generic).
     template <typename Scalar, int D>
-    IGL_INLINE Eigen::Matrix<Scalar,D,D-1> orthonormal_complement(
-      const Eigen::Matrix<Scalar,D,1> & unit_vec)
+    struct OrthonormalComplement
     {
-      Eigen::HouseholderQR<Eigen::Matrix<Scalar,D,1>> qr(unit_vec);
-      const Eigen::Matrix<Scalar,D,D> Q = qr.householderQ();
-      return Q.template rightCols<D-1>();
-    }
+      static IGL_INLINE Eigen::Matrix<Scalar,D,D-1> compute(
+        const Eigen::Matrix<Scalar,D,1> & unit_vec)
+      {
+        Eigen::HouseholderQR<Eigen::Matrix<Scalar,D,1>> qr(unit_vec);
+        const Eigen::Matrix<Scalar,D,D> Q = qr.householderQ();
+        return Q.template rightCols<D-1>();
+      }
+    };
+
+    // D=1 -> 0: no free directions remain; nothing to compute.
+    template <typename Scalar>
+    struct OrthonormalComplement<Scalar,1>
+    {
+      static IGL_INLINE Eigen::Matrix<Scalar,1,0> compute(const Eigen::Matrix<Scalar,1,1> &)
+      {
+        return Eigen::Matrix<Scalar,1,0>();
+      }
+    };
+
+    // D=2 -> 1: a 90-degree rotation of a unit 2-vector is already unit and
+    // orthogonal -- no factorization needed at all.
+    template <typename Scalar>
+    struct OrthonormalComplement<Scalar,2>
+    {
+      static IGL_INLINE Eigen::Matrix<Scalar,2,1> compute(const Eigen::Matrix<Scalar,2,1> & n)
+      {
+        return Eigen::Matrix<Scalar,2,1>(-n.y(), n.x());
+      }
+    };
+
+    // D=3 -> 2: branchless orthonormal-basis construction, robust for any
+    // unit n (including n close to (0,0,-1)). Duff, Burgess, Christensen,
+    // Hery, Kensler, Liani, Villemin, "Building an Orthonormal Basis,
+    // Revisited" (JCGT 2017) -- this is the standard fast/robust technique
+    // and satisfies the spec's "robust fallback axis selection" requirement
+    // without any axis case-analysis.
+    template <typename Scalar>
+    struct OrthonormalComplement<Scalar,3>
+    {
+      static IGL_INLINE Eigen::Matrix<Scalar,3,2> compute(const Eigen::Matrix<Scalar,3,1> & n)
+      {
+        const Scalar sign = n.z() >= Scalar(0) ? Scalar(1) : Scalar(-1);
+        const Scalar a = Scalar(-1) / (sign + n.z());
+        const Scalar b = n.x() * n.y() * a;
+        Eigen::Matrix<Scalar,3,2> N;
+        N.col(0) << Scalar(1) + sign * n.x() * n.x() * a, sign * b, -sign * n.x();
+        N.col(1) << b, sign + n.y() * n.y() * a, -n.y();
+        return N;
+      }
+    };
 
     // Recursive Seidel/SDLP-style projection of q onto the intersection of
     // the first `count` halfspaces named by `ids` (a fixed permutation
@@ -96,7 +143,7 @@ namespace igl
           const Eigen::Matrix<Scalar,D,1> z0 = (beta / alpha_sq) * alpha;
           const Eigen::Matrix<Scalar,Dim,1> o_new = o + U * z0;
           const Eigen::Matrix<Scalar,D,1> alpha_unit = alpha / alpha_norm;
-          const Eigen::Matrix<Scalar,D,D-1> N = orthonormal_complement<Scalar,D>(alpha_unit);
+          const Eigen::Matrix<Scalar,D,D-1> N = OrthonormalComplement<Scalar,D>::compute(alpha_unit);
           const Eigen::Matrix<Scalar,Dim,D-1> U_new = U * N;
 
           Eigen::Matrix<Scalar,Dim,1> p2;
