@@ -65,6 +65,22 @@ spec's test plan (sections A-C; sections D-E, which need real meshes, live in
 the separate [`fixed-dim-qp-bench`](https://github.com/alecjacobson/fixed-dim-qp-bench)
 repo).
 
+## Considered and rejected: fixed-size (non-Dynamic) plane count
+
+`A`/`b` use `Eigen::Dynamic` rows (the plane count `m`). It's tempting to
+template the solver on a max plane count too, since typical mesh valence is
+small -- but measured first: isolated microbenchmarks showed (1) row-major
+vs. the default column-major storage for `A` makes no measurable difference
+at `Dim=3` (2.58ns vs 2.61ns for a 10-row scan; everything fits in
+cache/registers regardless of layout), and (2) allocation-only construction
+cost for a dynamic vs. fixed-size plane matrix is a real but tiny ~5ns
+difference. More fundamentally, `A`/`b` are built once by the *caller* and
+passed by `const&` -- this solver never allocates or copies them, so there's
+no allocation here to eliminate in the first place. Not pursued. (The one
+place a fixed-size construction could still matter is the *caller*, e.g.
+`progressive_hulls_cost_and_placement`, which rebuilds `A`/`b` fresh per
+edge -- out of scope for this repo.)
+
 ## Build
 
 ```sh
